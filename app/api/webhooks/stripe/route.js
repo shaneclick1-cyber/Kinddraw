@@ -5,10 +5,6 @@ import { createClient } from '@supabase/supabase-js';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-export async function GET() {
-  return new Response('ok', { status: 200 });
-}
-
 export async function POST(req) {
   const endpointSecret =
     process.env.STRIPE_WEBHOOK_SECRET || process.env.STRIPE_WEBHOOKS_SECRET;
@@ -22,52 +18,38 @@ export async function POST(req) {
 
   const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' });
 
-  // Verify signature using RAW body
   let event;
   try {
     const sig = req.headers.get('stripe-signature');
-    const rawBody = await req.text();
-    event = stripe.webhooks.constructEvent(rawBody, sig, endpointSecret);
+    const raw = await req.text();                      // RAW body required
+    event = stripe.webhooks.constructEvent(raw, sig, endpointSecret);
   } catch (err) {
-    console.error('⚠️  Signature verification failed:', err?.message);
+    console.error('⚠️  Stripe signature verification failed:', err?.message);
     return new Response('Bad signature', { status: 400 });
   }
 
-  // Server-only Supabase client
   const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY
   );
 
   async function upsertFromSession(s) {
-    // Campaign id from either key
     const campaign_id =
       s.metadata?.campaign ||
       s.metadata?.campaignId ||
       'default';
 
-    // Prefer explicit entries (works with 100% promo)
-    const metaEntries = Number(s.metadata?.packEntries || 0);
-
-    // Amount & currency
+    const entriesMeta = Number(s.metadata?.packEntries || 0);
     const amount_cents = typeof s.amount_total === 'number' ? s.amount_total : 0;
     const currency = (s.currency || 'usd').toLowerCase();
 
-    // Fallback: $1 = 1 entry
-    const entries = metaEntries > 0 ? metaEntries : Math.max(0, Math.floor((amount_cents || 0) / 100));
+    const entries = entriesMeta > 0
+      ? entriesMeta
+      : Math.max(0, Math.floor((amount_cents || 0) / 100));
 
-    // Accept free checkouts too
     const status = (s.payment_status === 'paid' || s.payment_status === 'no_payment_required')
       ? s.payment_status
       : (s.payment_status || 'completed');
-
-    // Discounts
-    const discount_cents = s.total_details?.amount_discount ?? 0;
-    // Try to capture a promo id if present
-    const promo_code_id =
-      s.total_details?.breakdown?.discounts?.[0]?.discount?.id ??
-      s.discounts?.[0]?.promotion_code ??
-      null;
 
     if (!campaign_id || entries <= 0) {
       console.warn('Skipping upsert: missing campaign_id or entries<=0', { campaign_id, entries, amount_cents });
@@ -80,10 +62,7 @@ export async function POST(req) {
       amount_cents,
       currency,
       status,
-      stripe_session_id: s.id,
-      discount_cents,
-      promo_code_id
-      // NOTE: no page_id here to match your existing table
+      stripe_session_id: s.id
     };
 
     const { error } = await supabase
@@ -99,9 +78,6 @@ export async function POST(req) {
         const s = event.data.object;
         if (s.payment_status === 'paid' || s.payment_status === 'no_payment_required') {
           await upsertFromSession(s);
-        } else {
-          // async wallets may confirm later
-          console.log('Session completed but not finalized yet:', s.payment_status);
         }
         break;
       }
@@ -133,6 +109,10 @@ export async function POST(req) {
     return new Response('ok', { status: 200 });
   } catch (err) {
     console.error('Webhook handler error:', err);
-    return new Response('ok', { status: 200 }); // prevent endless retries
+    return new Response('ok', { status: 200 });
   }
+}
+
+export async function GET() {
+  return new Response('ok', { status: 200 });
 }
