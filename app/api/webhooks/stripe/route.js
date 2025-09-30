@@ -9,10 +9,14 @@ export async function POST(req) {
   const endpointSecret =
     process.env.STRIPE_WEBHOOK_SECRET || process.env.STRIPE_WEBHOOKS_SECRET;
 
+  const SUPABASE_URL =
+    process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+  const SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
   if (!process.env.STRIPE_SECRET_KEY || !endpointSecret) {
     return new Response('Missing STRIPE_SECRET_KEY or STRIPE_WEBHOOK_SECRET', { status: 500 });
   }
-  if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  if (!SUPABASE_URL || !SERVICE_ROLE) {
     return new Response('Missing Supabase envs', { status: 500 });
   }
 
@@ -21,17 +25,14 @@ export async function POST(req) {
   let event;
   try {
     const sig = req.headers.get('stripe-signature');
-    const raw = await req.text();                      // RAW body required
+    const raw = await req.text(); // RAW body required
     event = stripe.webhooks.constructEvent(raw, sig, endpointSecret);
   } catch (err) {
     console.error('⚠️  Stripe signature verification failed:', err?.message);
     return new Response('Bad signature', { status: 400 });
   }
 
-  const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
+  const supabase = createClient(SUPABASE_URL, SERVICE_ROLE);
 
   async function upsertFromSession(s) {
     const campaign_id =
@@ -39,17 +40,19 @@ export async function POST(req) {
       s.metadata?.campaignId ||
       'default';
 
-    const entriesMeta = Number(s.metadata?.packEntries || 0);
-    const amount_cents = typeof s.amount_total === 'number' ? s.amount_total : 0;
-    const currency = (s.currency || 'usd').toLowerCase();
+    const entriesMeta   = Number(s.metadata?.packEntries || 0);
+    const amount_cents  = typeof s.amount_total === 'number' ? s.amount_total : 0;
+    const currency      = (s.currency || 'usd').toLowerCase();
+    const entries       = entriesMeta > 0 ? entriesMeta : Math.max(0, Math.floor((amount_cents || 0) / 100));
+    const status        = (s.payment_status === 'paid' || s.payment_status === 'no_payment_required')
+                            ? s.payment_status : (s.payment_status || 'completed');
 
-    const entries = entriesMeta > 0
-      ? entriesMeta
-      : Math.max(0, Math.floor((amount_cents || 0) / 100));
-
-    const status = (s.payment_status === 'paid' || s.payment_status === 'no_payment_required')
-      ? s.payment_status
-      : (s.payment_status || 'completed');
+    // Optional fields your new table supports
+    const discount_cents = s.total_details?.amount_discount ?? 0;
+    const promo_code_id =
+      s.total_details?.breakdown?.discounts?.[0]?.discount?.id ??
+      s.discounts?.[0]?.promotion_code ??
+      null;
 
     if (!campaign_id || entries <= 0) {
       console.warn('Skipping upsert: missing campaign_id or entries<=0', { campaign_id, entries, amount_cents });
@@ -62,11 +65,13 @@ export async function POST(req) {
       amount_cents,
       currency,
       status,
-      stripe_session_id: s.id
+      stripe_session_id: s.id,
+      discount_cents,
+      promo_code_id
     };
 
     const { error } = await supabase
-      .from('orders')
+      .from('orders2')               // <-- write to orders2
       .upsert(row, { onConflict: 'stripe_session_id' });
 
     if (error) console.error('Supabase upsert error:', error, { row });
@@ -93,7 +98,7 @@ export async function POST(req) {
           const linked = list?.data?.[0];
           if (linked?.id) {
             const { error } = await supabase
-              .from('orders')
+              .from('orders2')       // <-- update in orders2
               .update({ status: 'refunded' })
               .eq('stripe_session_id', linked.id);
             if (error) console.error('Supabase refund update error:', error);
@@ -113,6 +118,4 @@ export async function POST(req) {
   }
 }
 
-export async function GET() {
-  return new Response('ok', { status: 200 });
-}
+export async function GET() { return new Response('ok', { status: 200 }); }
